@@ -6,25 +6,21 @@ const crypto = require('crypto');
 const app = express();
 const server = http.createServer(app);
 
-// ─── CORS CONFIG ──────────────────────────────────────────────────────────────
-// Replace with your GitHub Pages URL when deployed
-const ALLOWED_ORIGINS = [
-  'http://localhost:5500',
-  'http://127.0.0.1:5500',
-  'http://localhost:3000',
-  'https://YOUR_GITHUB_USERNAME.github.io', // ← replace this
-];
+// Serve static files (frontend)
+app.use(express.static(__dirname));
 
+// ─── CORS CONFIG ──────────────────────────────────────────────────────────────
 const io = new Server(server, {
   cors: {
-    origin: ALLOWED_ORIGINS,
+    origin: true,
     methods: ['GET', 'POST'],
   },
 });
 
 // ─── IN-MEMORY STATE ──────────────────────────────────────────────────────────
-const waitingQueue = []; // socket IDs waiting for a partner
+const waitingQueue = []; // [{ id, interests, maxWait, queuedAt }]
 const activePairs = new Map(); // socketId → partnerId
+const userSettings = new Map(); // socketId → { interests, maxWait }
 const sessions = new Map(); // socketId → session metadata
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -41,11 +37,11 @@ function broadcastOnlineCount() {
 }
 
 function removeFromQueue(socketId) {
-  const idx = waitingQueue.indexOf(socketId);
+  const idx = waitingQueue.findIndex(u => u.id === socketId);
   if (idx !== -1) waitingQueue.splice(idx, 1);
 }
 
-function pairUsers(socket1Id, socket2Id) {
+function pairUsers(socket1Id, socket2Id, sharedInterests = []) {
   const sessionId = generateSessionId();
 
   activePairs.set(socket1Id, socket2Id);
@@ -54,14 +50,15 @@ function pairUsers(socket1Id, socket2Id) {
   sessions.set(socket1Id, { sessionId, paired: true, pairedAt: Date.now() });
   sessions.set(socket2Id, { sessionId, paired: true, pairedAt: Date.now() });
 
-  io.to(socket1Id).emit('chat_start', { sessionId });
-  io.to(socket2Id).emit('chat_start', { sessionId });
+  io.to(socket1Id).emit('chat_start', { sessionId, sharedInterests });
+  io.to(socket2Id).emit('chat_start', { sessionId, sharedInterests });
 
-  console.log(`[pair] ${socket1Id.slice(0,6)} ↔ ${socket2Id.slice(0,6)} (${sessionId})`);
+  console.log(`[pair] ${socket1Id.slice(0,6)} ↔ ${socket2Id.slice(0,6)} (${sessionId}) shared: [${sharedInterests.join(', ')}]`);
 }
 
 function cleanupUser(socketId) {
   removeFromQueue(socketId);
+  userSettings.delete(socketId);
 
   const partnerId = activePairs.get(socketId);
   if (partnerId) {
@@ -78,28 +75,60 @@ function cleanupUser(socketId) {
 }
 
 function sendQueuePositions() {
-  waitingQueue.forEach((socketId, index) => {
-    io.to(socketId).emit('queue_position', index + 1);
+  waitingQueue.forEach((user, index) => {
+    io.to(user.id).emit('queue_position', index + 1);
   });
 }
 
 function tryMatch() {
-  while (waitingQueue.length >= 2) {
-    const id1 = waitingQueue.shift();
-    const id2 = waitingQueue.shift();
+  if (waitingQueue.length < 2) return;
 
-    // Verify both sockets still exist
-    const s1 = io.sockets.sockets.get(id1);
-    const s2 = io.sockets.sockets.get(id2);
+  // 1. Try Interest-based Matching
+  for (let i = 0; i < waitingQueue.length; i++) {
+    for (let j = i + 1; j < waitingQueue.length; j++) {
+      const u1 = waitingQueue[i];
+      const u2 = waitingQueue[j];
 
-    if (s1 && s2) {
-      pairUsers(id1, id2);
-    } else {
-      // Put valid one back
-      if (s1) waitingQueue.unshift(id1);
-      if (s2) waitingQueue.unshift(id2);
+      const shared = u1.interests.filter(tag => u2.interests.includes(tag));
+      if (shared.length > 0) {
+        // Remove both from queue (higher index first to avoid shifts)
+        waitingQueue.splice(j, 1);
+        waitingQueue.splice(i, 1);
+        pairUsers(u1.id, u2.id, shared);
+        return tryMatch(); // Recurse
+      }
     }
   }
+
+  // 2. Try Fallback (FIFO) for blind-eligible users
+  const now = Date.now();
+  const getBlindEligibleIdx = () => waitingQueue.findIndex(u => {
+    if (u.interests.length === 0) return true;
+    if (u.maxWait === -1) return false; // Forever means NEVER blind match
+    return (now - u.queuedAt) > (u.maxWait * 1000);
+  });
+
+  let idx1 = getBlindEligibleIdx();
+  if (idx1 !== -1) {
+    for (let j = 0; j < waitingQueue.length; j++) {
+      if (j === idx1) continue;
+      
+      const u2 = waitingQueue[j];
+      const isU2Eligible = u2.interests.length === 0 || 
+                           (u2.maxWait !== -1 && (now - u2.queuedAt) > (u2.maxWait * 1000));
+      
+      if (isU2Eligible) {
+        const u1 = waitingQueue[idx1];
+        const firstIdx = Math.min(idx1, j);
+        const secondIdx = Math.max(idx1, j);
+        waitingQueue.splice(secondIdx, 1);
+        waitingQueue.splice(firstIdx, 1);
+        pairUsers(u1.id, u2.id, []);
+        return tryMatch();
+      }
+    }
+  }
+
   sendQueuePositions();
 }
 
@@ -108,18 +137,26 @@ io.on('connection', (socket) => {
   console.log(`[connect] ${socket.id.slice(0,6)} (total: ${getOnlineCount()})`);
   broadcastOnlineCount();
 
-  // Send current count to new user
   socket.emit('online_count', getOnlineCount());
 
   // ── FIND STRANGER ──
-  socket.on('find_stranger', () => {
-    // Must not already be in a chat or queue
+  socket.on('find_stranger', (settings) => {
     if (activePairs.has(socket.id)) return;
     removeFromQueue(socket.id);
 
-    waitingQueue.push(socket.id);
-    console.log(`[queue] ${socket.id.slice(0,6)} waiting (queue: ${waitingQueue.length})`);
-    sendQueuePositions();
+    const interests = Array.isArray(settings?.interests) ? settings.interests.slice(0, 10) : [];
+    const maxWait = typeof settings?.maxWait === 'number' ? settings.maxWait : 30;
+
+    userSettings.set(socket.id, { interests, maxWait });
+    
+    waitingQueue.push({
+      id: socket.id,
+      interests,
+      maxWait,
+      queuedAt: Date.now()
+    });
+
+    console.log(`[queue] ${socket.id.slice(0,6)} waiting with ${interests.length} tags (queue: ${waitingQueue.length})`);
     tryMatch();
   });
 
@@ -131,19 +168,44 @@ io.on('connection', (socket) => {
   });
 
   // ── MESSAGE ──
-  socket.on('message', ({ text }) => {
+  socket.on('message', ({ text, id, replyTo }) => {
     if (typeof text !== 'string') return;
-
-    const trimmed = text.trim().slice(0, 500); // enforce limit server-side
+    const trimmed = text.trim().slice(0, 500);
     if (!trimmed) return;
 
     const partnerId = activePairs.get(socket.id);
     if (!partnerId) return;
 
     const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    io.to(partnerId).emit('message', { text: trimmed, timestamp });
-
+    io.to(partnerId).emit('message', { text: trimmed, timestamp, id, replyTo });
     console.log(`[msg] ${socket.id.slice(0,6)} → ${partnerId.slice(0,6)}: "${trimmed.slice(0,40)}"`);
+  });
+
+  // ── VOICE MESSAGE ──
+  socket.on('voice_message', ({ audio, id, replyTo }) => {
+    const partnerId = activePairs.get(socket.id);
+    if (!partnerId) return;
+
+    io.to(partnerId).emit('voice_message', { audio, id, replyTo });
+    console.log(`[voice] ${socket.id.slice(0,6)} → ${partnerId.slice(0,6)} (${id})`);
+  });
+
+  // ── EDIT MESSAGE ──
+  socket.on('message_edit', ({ id, text }) => {
+    const partnerId = activePairs.get(socket.id);
+    if (!partnerId) return;
+
+    io.to(partnerId).emit('message_edit', { id, text });
+    console.log(`[edit] ${socket.id.slice(0,6)} edited ${id}`);
+  });
+
+  // ── REACTION ──
+  socket.on('message_reaction', ({ msgId, emoji }) => {
+    const partnerId = activePairs.get(socket.id);
+    if (!partnerId) return;
+
+    io.to(partnerId).emit('message_reaction', { msgId, emoji });
+    console.log(`[react] ${socket.id.slice(0,6)} reacted to ${msgId} with ${emoji}`);
   });
 
   // ── TYPING ──
@@ -160,20 +222,22 @@ io.on('connection', (socket) => {
   // ── SKIP ──
   socket.on('skip_stranger', () => {
     const partnerId = activePairs.get(socket.id);
-
     if (partnerId) {
       activePairs.delete(socket.id);
       activePairs.delete(partnerId);
       sessions.delete(socket.id);
       sessions.delete(partnerId);
-
       io.to(partnerId).emit('stranger_skipped');
       console.log(`[skip] ${socket.id.slice(0,6)} skipped ${partnerId.slice(0,6)}`);
     }
 
-    // Re-queue skipper
-    waitingQueue.push(socket.id);
-    sendQueuePositions();
+    const settings = userSettings.get(socket.id) || { interests: [], maxWait: 30 };
+    waitingQueue.push({
+      id: socket.id,
+      interests: settings.interests,
+      maxWait: settings.maxWait,
+      queuedAt: Date.now()
+    });
     tryMatch();
   });
 
@@ -199,7 +263,8 @@ io.on('connection', (socket) => {
   });
 });
 
-// ─── HTTP HEALTH CHECK ────────────────────────────────────────────────────────
+setInterval(tryMatch, 1000);
+
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
@@ -209,8 +274,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// ─── START ────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`\n🟢 strangerz server running on port ${PORT}\n`);
 });
