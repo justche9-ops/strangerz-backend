@@ -2,11 +2,13 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const crypto = require('crypto');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
 
 // Serve static files (frontend)
+app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.static(__dirname));
 
 // ─── CORS CONFIG ──────────────────────────────────────────────────────────────
@@ -83,48 +85,55 @@ function sendQueuePositions() {
 function tryMatch() {
   if (waitingQueue.length < 2) return;
 
-  // 1. Try Interest-based Matching
-  for (let i = 0; i < waitingQueue.length; i++) {
-    for (let j = i + 1; j < waitingQueue.length; j++) {
-      const u1 = waitingQueue[i];
-      const u2 = waitingQueue[j];
+  let matched = true;
+  while (matched && waitingQueue.length >= 2) {
+    matched = false;
+    // 1. Try Interest-based Matching
+    for (let i = 0; i < waitingQueue.length; i++) {
+      for (let j = i + 1; j < waitingQueue.length; j++) {
+        const u1 = waitingQueue[i];
+        const u2 = waitingQueue[j];
 
-      const shared = u1.interests.filter(tag => u2.interests.includes(tag));
-      if (shared.length > 0) {
-        // Remove both from queue (higher index first to avoid shifts)
-        waitingQueue.splice(j, 1);
-        waitingQueue.splice(i, 1);
-        pairUsers(u1.id, u2.id, shared);
-        return tryMatch(); // Recurse
+        const shared = u1.interests.filter(tag => u2.interests.includes(tag));
+        if (shared.length > 0) {
+          waitingQueue.splice(j, 1);
+          waitingQueue.splice(i, 1);
+          pairUsers(u1.id, u2.id, shared);
+          matched = true;
+          break; // Break inner, will continue while loop
+        }
       }
+      if (matched) break; // Break outer
     }
   }
 
   // 2. Try Fallback (FIFO) for blind-eligible users
-  const now = Date.now();
-  const getBlindEligibleIdx = () => waitingQueue.findIndex(u => {
-    if (u.interests.length === 0) return true;
-    if (u.maxWait === -1) return false; // Forever means NEVER blind match
-    return (now - u.queuedAt) > (u.maxWait * 1000);
-  });
+  if (waitingQueue.length >= 2) {
+    const now = Date.now();
+    const getBlindEligibleIdx = () => waitingQueue.findIndex(u => {
+      if (u.interests.length === 0) return true;
+      if (u.maxWait === -1) return false;
+      return (now - u.queuedAt) > (u.maxWait * 1000);
+    });
 
-  let idx1 = getBlindEligibleIdx();
-  if (idx1 !== -1) {
-    for (let j = 0; j < waitingQueue.length; j++) {
-      if (j === idx1) continue;
-      
-      const u2 = waitingQueue[j];
-      const isU2Eligible = u2.interests.length === 0 || 
-                           (u2.maxWait !== -1 && (now - u2.queuedAt) > (u2.maxWait * 1000));
-      
-      if (isU2Eligible) {
-        const u1 = waitingQueue[idx1];
-        const firstIdx = Math.min(idx1, j);
-        const secondIdx = Math.max(idx1, j);
-        waitingQueue.splice(secondIdx, 1);
-        waitingQueue.splice(firstIdx, 1);
-        pairUsers(u1.id, u2.id, []);
-        return tryMatch();
+    let idx1 = getBlindEligibleIdx();
+    if (idx1 !== -1) {
+      for (let j = 0; j < waitingQueue.length; j++) {
+        if (j === idx1) continue;
+        
+        const u2 = waitingQueue[j];
+        const isU2Eligible = u2.interests.length === 0 || 
+                             (u2.maxWait !== -1 && (now - u2.queuedAt) > (u2.maxWait * 1000));
+        
+        if (isU2Eligible) {
+          const u1 = waitingQueue[idx1];
+          const firstIdx = Math.min(idx1, j);
+          const secondIdx = Math.max(idx1, j);
+          waitingQueue.splice(secondIdx, 1);
+          waitingQueue.splice(firstIdx, 1);
+          pairUsers(u1.id, u2.id, []);
+          return tryMatch(); // Fallback can still recurse once as it's rare
+        }
       }
     }
   }
@@ -208,6 +217,23 @@ io.on('connection', (socket) => {
     console.log(`[react] ${socket.id.slice(0,6)} reacted to ${msgId} with ${emoji}`);
   });
 
+  // ── MESSAGE STATUS ──
+  socket.on('message_delivered', ({ msgId }) => {
+    const partnerId = activePairs.get(socket.id);
+    if (partnerId) {
+      io.to(partnerId).emit('message_delivered', { msgId });
+      console.log(`[delivered] ${socket.id.slice(0,6)} acknowledged ${msgId}`);
+    }
+  });
+
+  socket.on('message_seen', ({ msgId }) => {
+    const partnerId = activePairs.get(socket.id);
+    if (partnerId) {
+      io.to(partnerId).emit('message_seen', { msgId });
+      console.log(`[seen] ${socket.id.slice(0,6)} viewed ${msgId}`);
+    }
+  });
+
   // ── TYPING ──
   socket.on('typing_start', () => {
     const partnerId = activePairs.get(socket.id);
@@ -265,7 +291,7 @@ io.on('connection', (socket) => {
 
 setInterval(tryMatch, 1000);
 
-app.get('/', (req, res) => {
+app.get('/status', (req, res) => {
   res.json({
     status: 'ok',
     online: getOnlineCount(),
