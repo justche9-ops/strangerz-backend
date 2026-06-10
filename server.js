@@ -186,39 +186,7 @@ io.on('connection', (socket) => {
   socket.emit('online_count', getOnlineCount());
 
   // ── FIND STRANGER ──
-  socket.on('find_stranger', async (settings) => {
-    // Cloudflare Turnstile Verification
-    const turnstileToken = settings?.turnstileToken;
-    if (!turnstileToken && ip !== '127.0.0.1' && ip !== '::1') {
-      socket.emit('error_msg', 'Security check failed. Please refresh.');
-      return;
-    }
-
-    if (ip !== '127.0.0.1' && ip !== '::1') {
-      try {
-        const formData = new FormData();
-        formData.append('secret', process.env.CLOUDFLARE_SECRET_KEY);
-        formData.append('response', turnstileToken);
-        formData.append('remoteip', ip);
-
-        const result = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-          body: formData,
-          method: 'POST',
-        });
-
-        const outcome = await result.json();
-        if (!outcome.success) {
-          console.log(`[security] Turnstile failed for ${ip}`);
-          socket.emit('error_msg', 'Security verification failed');
-          return;
-        }
-      } catch (err) {
-        console.error('[security] Turnstile error:', err);
-        // Fallback: if Cloudflare is down, we might want to allow or block. 
-        // For now, let's allow to be safe but log it.
-      }
-    }
-
+  socket.on('find_stranger', (settings) => {
     // Throttling: Prevent spamming 'find_stranger'
     const lastFind = socket.lastFindAt || 0;
     if (Date.now() - lastFind < 3000) return; // 3s cooldown
