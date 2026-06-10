@@ -24,8 +24,24 @@ const waitingQueue = []; // [{ id, interests, maxWait, queuedAt }]
 const activePairs = new Map(); // socketId → partnerId
 const userSettings = new Map(); // socketId → { interests, maxWait }
 const sessions = new Map(); // socketId → session metadata
+const bannedIPs = new Map(); // IP → expirationTime
+const connectionCounts = new Map(); // IP → count
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
+function getIP(socket) {
+  return socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+}
+
+function isBanned(socket) {
+  const ip = getIP(socket);
+  if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return false; // Whitelist local
+  if (bannedIPs.has(ip)) {
+    if (Date.now() < bannedIPs.get(ip)) return true;
+    bannedIPs.delete(ip); // Ban expired
+  }
+  return false;
+}
+
 function generateSessionId() {
   return crypto.randomBytes(8).toString('hex');
 }
@@ -143,13 +159,71 @@ function tryMatch() {
 
 // ─── SOCKET HANDLERS ──────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
+  const ip = getIP(socket);
+
+  if (isBanned(socket)) {
+    console.log(`[banned] Rejected connection from ${ip}`);
+    socket.disconnect(true);
+    return;
+  }
+
+  // Connection Limit (Bot Protection)
+  const currentCount = connectionCounts.get(ip) || 0;
+  if (currentCount >= 3 && ip !== '127.0.0.1' && ip !== '::1') {
+    console.log(`[limit] Too many connections from ${ip}`);
+    socket.emit('error_msg', 'Too many connections from this IP');
+    socket.disconnect(true);
+    return;
+  }
+  connectionCounts.set(ip, currentCount + 1);
+
+  // Message Throttling State
+  let messageTimestamps = [];
+
   console.log(`[connect] ${socket.id.slice(0,6)} (total: ${getOnlineCount()})`);
   broadcastOnlineCount();
 
   socket.emit('online_count', getOnlineCount());
 
   // ── FIND STRANGER ──
-  socket.on('find_stranger', (settings) => {
+  socket.on('find_stranger', async (settings) => {
+    // Cloudflare Turnstile Verification
+    const turnstileToken = settings?.turnstileToken;
+    if (!turnstileToken && ip !== '127.0.0.1' && ip !== '::1') {
+      socket.emit('error_msg', 'Security check failed. Please refresh.');
+      return;
+    }
+
+    if (ip !== '127.0.0.1' && ip !== '::1') {
+      try {
+        const formData = new FormData();
+        formData.append('secret', process.env.CLOUDFLARE_SECRET_KEY);
+        formData.append('response', turnstileToken);
+        formData.append('remoteip', ip);
+
+        const result = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+          body: formData,
+          method: 'POST',
+        });
+
+        const outcome = await result.json();
+        if (!outcome.success) {
+          console.log(`[security] Turnstile failed for ${ip}`);
+          socket.emit('error_msg', 'Security verification failed');
+          return;
+        }
+      } catch (err) {
+        console.error('[security] Turnstile error:', err);
+        // Fallback: if Cloudflare is down, we might want to allow or block. 
+        // For now, let's allow to be safe but log it.
+      }
+    }
+
+    // Throttling: Prevent spamming 'find_stranger'
+    const lastFind = socket.lastFindAt || 0;
+    if (Date.now() - lastFind < 3000) return; // 3s cooldown
+    socket.lastFindAt = Date.now();
+
     if (activePairs.has(socket.id)) return;
     removeFromQueue(socket.id);
 
@@ -178,6 +252,18 @@ io.on('connection', (socket) => {
 
   // ── MESSAGE ──
   socket.on('message', ({ text, id, replyTo }) => {
+    // Spam Detection: Max 5 messages in 2 seconds
+    const now = Date.now();
+    messageTimestamps = messageTimestamps.filter(ts => now - ts < 2000);
+    messageTimestamps.push(now);
+    
+    if (messageTimestamps.length > 5) {
+      console.log(`[spam] ${socket.id.slice(0,6)} kicked for spamming`);
+      socket.emit('error_msg', 'You are sending messages too fast');
+      socket.disconnect(true);
+      return;
+    }
+
     if (typeof text !== 'string') return;
     const trimmed = text.trim().slice(0, 500);
     if (!trimmed) return;
@@ -192,6 +278,11 @@ io.on('connection', (socket) => {
 
   // ── VOICE MESSAGE ──
   socket.on('voice_message', ({ audio, id, replyTo }) => {
+    // Voice Spam: Max 3 in 10 seconds
+    socket.voiceTimestamps = (socket.voiceTimestamps || []).filter(ts => Date.now() - ts < 10000);
+    socket.voiceTimestamps.push(Date.now());
+    if (socket.voiceTimestamps.length > 3) return;
+
     const partnerId = activePairs.get(socket.id);
     if (!partnerId) return;
 
@@ -247,6 +338,11 @@ io.on('connection', (socket) => {
 
   // ── SKIP ──
   socket.on('skip_stranger', () => {
+    // Throttling: Prevent skip-spamming
+    const now = Date.now();
+    if (now - (socket.lastSkipAt || 0) < 2000) return;
+    socket.lastSkipAt = now;
+
     const partnerId = activePairs.get(socket.id);
     if (partnerId) {
       activePairs.delete(socket.id);
@@ -280,8 +376,32 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ── REPORT USER ──
+  socket.on('report_user', () => {
+    const partnerId = activePairs.get(socket.id);
+    if (partnerId) {
+      const partnerSocket = io.sockets.sockets.get(partnerId);
+      if (partnerSocket) {
+        const partnerIP = getIP(partnerSocket);
+        bannedIPs.set(partnerIP, Date.now() + 3600000); // 1 hour ban
+        console.log(`[report] ${socket.id.slice(0,6)} reported ${partnerId.slice(0,6)}. IP ${partnerIP} banned.`);
+        partnerSocket.emit('stranger_disconnected'); // Notify them they are out
+        partnerSocket.disconnect(true);
+      }
+      
+      activePairs.delete(socket.id);
+      activePairs.delete(partnerId);
+      sessions.delete(socket.id);
+      sessions.delete(partnerId);
+    }
+  });
+
   // ── DISCONNECT ──
   socket.on('disconnect', () => {
+    const count = connectionCounts.get(ip) || 1;
+    if (count > 1) connectionCounts.set(ip, count - 1);
+    else connectionCounts.delete(ip);
+
     cleanupUser(socket.id);
     broadcastOnlineCount();
     sendQueuePositions();
